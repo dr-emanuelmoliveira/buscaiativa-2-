@@ -1,0 +1,2047 @@
+busca_ativa_inteligente.py — código-fonte (Busca Ativa Inteligente — Multi-indicadores, e-SUS APS)
+# -*- coding: utf-8 -*-
+"""
+Busca Ativa Inteligente - Multi-indicadores (e-SUS APS)
+Versao corrigida e otimizada.
+
+Correcoes aplicadas:
+- imports ausentes (csv, io, matplotlib) adicionados
+- remocao de dependencias do Colab (files.upload, display)
+- normalizacao de texto via unicodedata (1 passada em vez de 7 regex)
+- pre-normalizacao de padroes na deteccao de indicador
+- correcao de UnboundLocalError em data_e_quantidade
+- correcao de KeyError em data_ou_meses
+- leitura de CSV unificada em carregar_e_usar_modelo
+- agenda sem descarte silencioso de pacientes
+- cache de parsing de datas
+"""
+
+from __future__ import annotations
+
+import csv
+import io
+import os
+import re
+import unicodedata
+import warnings
+from collections import Counter, defaultdict
+from datetime import datetime, timedelta
+from functools import lru_cache
+from pathlib import Path
+from typing import Any, Iterable, Sequence
+
+import joblib
+import numpy as np
+import pandas as pd
+from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
+from sklearn.metrics import accuracy_score, classification_report
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import LabelEncoder
+
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    _HAS_MPL = True
+except ImportError:
+    _HAS_MPL = False
+
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=UserWarning, module="sklearn")
+
+
+# ============================================================
+# --- 2. FUNCOES AUXILIARES ---
+# ============================================================
+
+@lru_cache(maxsize=8192)
+def _normalizar_texto(texto: Any) -> str:
+    """Normaliza texto: minusculas, sem acentos, sem pontuacao."""
+    if not isinstance(texto, str):
+        return ""
+    decomposto = unicodedata.normalize("NFKD", texto.lower())
+    sem_acento = "".join(c for c in decomposto if not unicodedata.combining(c))
+    limpo = re.sub(r"[^a-z0-9\s]", "", sem_acento)
+    return " ".join(limpo.split())
+
+
+_FORMATOS_DATA = (
+    "%d/%m/%Y", "%d/%m/%y",
+    "%Y-%m-%d",
+    "%d-%m-%Y", "%d-%m-%y",
+    "%Y/%m/%d",
+    "%m/%d/%Y", "%m/%d/%y",
+)
+
+
+@lru_cache(maxsize=65536)
+def _parse_data(data_str: Any) -> Any:
+    """Converte string para datetime, suportando multiplos formatos."""
+    if data_str is None or (isinstance(data_str, float) and pd.isna(data_str)):
+        return pd.NaT
+    texto = str(data_str).strip()
+    if not texto:
+        return pd.NaT
+    for fmt in _FORMATOS_DATA:
+        try:
+            return datetime.strptime(texto, fmt)
+        except ValueError:
+            continue
+    return pd.NaT
+
+
+def _para_numero(valor: Any) -> float | None:
+    """Converte '365', '12 meses', '365,0' em numero. None se invalido."""
+    if valor is None:
+        return None
+    try:
+        if pd.isna(valor):
+            return None
+    except (TypeError, ValueError):
+        pass
+    if isinstance(valor, str):
+        texto = valor.strip().replace(",", ".")
+        for palavra in ("dias", "dia", "meses", "mes", "mês"):
+            texto = texto.replace(palavra, "")
+        texto = texto.strip()
+        if not texto:
+            return None
+    else:
+        texto = valor
+    try:
+        numero = float(texto)
+    except (TypeError, ValueError):
+        return None
+    return int(numero) if numero.is_integer() else numero
+
+
+def _extrair_meses(val: Any) -> int:
+    numero = _para_numero(val)
+    return int(numero) if numero is not None else 0
+
+
+def _parse_idade(val: Any) -> int:
+    numero = _para_numero(val)
+    if numero is None:
+        return 0
+    idade = int(numero)
+    return idade if 0 < idade < 130 else 0
+
+
+def _valor_valido(valor: Any) -> bool:
+    if valor is None:
+        return False
+    try:
+        if pd.isna(valor):
+            return False
+    except (TypeError, ValueError):
+        pass
+    return not (isinstance(valor, str) and not valor.strip())
+
+
+def _obter_dias_de_colunas(linha, col_dias=None, col_meses=None):
+    """Obtem a quantidade de dias de um criterio."""
+    indice_normalizado = {_normalizar_texto(str(c)): c for c in linha.index}
+
+    def valor_da_config(candidato):
+        if not _valor_valido(candidato):
+            return None
+        if isinstance(candidato, (list, tuple, set)):
+            for item in candidato:
+                valor = valor_da_config(item)
+                if _valor_valido(valor):
+                    return valor
+            return None
+        if isinstance(candidato, (int, float)) and not isinstance(candidato, bool):
+            return candidato
+        nome = str(candidato).strip()
+        if not nome:
+            return None
+        if nome in linha.index:
+            return linha[nome]
+        coluna_real = indice_normalizado.get(_normalizar_texto(nome))
+        return linha[coluna_real] if coluna_real is not None else None
+
+    def candidatos(valor):
+        if not _valor_valido(valor):
+            return []
+        if isinstance(valor, (list, tuple, set)):
+            return list(valor)
+        return [valor]
+
+    for candidato in candidatos(col_dias):
+        numero = _para_numero(valor_da_config(candidato))
+        if numero is not None:
+            return numero, "dias"
+
+    for candidato in candidatos(col_meses):
+        numero = _para_numero(valor_da_config(candidato))
+        if numero is not None:
+            return numero * 30, "meses"
+
+    for valor, origem, fator in ((col_dias, "dias", 1), (col_meses, "meses", 30)):
+        if isinstance(valor, (int, float)) and not isinstance(valor, bool):
+            return valor * fator, origem
+
+    return None, None
+
+
+INDICADORES = {
+    "C2": {
+        "nome": "Desenvolvimento Infantil",
+        "num_boas_praticas": 6,
+        "padroes_decisivos": ["penta", "pentavalente", "polio", "poliomielite",
+                              "pneumo", "pneumococica", "puericultura", "30 dias",
+                              "desenvolvimento infantil", "idade em meses",
+                              "sarampo", "caxumba", "rubeola", "triplice viral",
+                              "difteria", "tetano", "pertussis", "haemophilus",
+                              "hepatite b", "hib", "dtp", "vip", "vpc10"],
+        "colunas_detectar": ["vac_penta", "vac_polio", "vac_scr", "vac_pneumo",
+                             "idade_meses", "qtd_atend_30d", "puericultura",
+                             "30 dias", "desenvolvimento infantil",
+                             "penta", "pentavalente", "polio", "poliomielite",
+                             "pneumo", "pneumococica",
+                             "sarampo", "caxumba", "rubeola", "triplice viral",
+                             "difteria", "tetano", "pertussis", "haemophilus",
+                             "hepatite b", "hib", "dtp", "vip", "vpc10"],
+        "colunas_excluir": ["hemoglobina", "influenza", "dTpa", "cito",
+                            "mamo", "HPV", "puerper", "trimestre", "mamografia",
+                            "citopatol", "sifilis", "hiv", "hepatite c",
+                            "pessoa idosa", "reprodutiva", "avaliacao dos pes",
+                            "gripe", "pre-natal", "prenatal", "odontol"],
+        "colunas_csv": {
+            "nome": ["Nome"],
+            "microarea": ["Microarea", "Microarea"],
+            "data_nascimento": ["Data de nascimento", "Data Nascimento",
+                                "Data de Nascimento", "DtNascimento",
+                                "Data Nasc", "Nascimento"],
+            "idade_meses": ["Idade em meses", "idade_meses", "Idade_meses"],
+            "qtd_atend_30d": ["Qtd atendimentos 30d", "qtd_atend_30d",
+                              "Quantidade de atendimentos nos primeiros 30 dias"],
+            "qtd_consultas": ["Qtd consultas", "qtd_consultas",
+                              "Quantidade de consultas"],
+            "qtd_antro": ["Qtd antropometrias", "qtd_antro",
+                          "Quantidade de antropometrias",
+                          "Quantidade de medicoes de peso e altura",
+                          "Quantidade de medicoes de peso/altura"],
+            "data_antro": ["Data da ultima medicao de peso e altura",
+                           "Data da ultima antropometria",
+                           "Data da ultima medicao de peso",
+                           "Data de peso e altura",
+                           "Antropometria"],
+            "qtd_visitas": ["Qtd visitas domiciliares", "qtd_visitas",
+                            "Quantidade de visitas domiciliares"],
+            "vac_penta": ["Vacina penta", "vac_penta", "Pentavalente",
+                          "Vacina pentavalente",
+                          "Vacina penta (DTP/HB/Hib)",
+                          "Vacina penta (DTP/HB/Hib) (PENTA)",
+                          "Difteria, Tetano, Pertussis, Hepatite B, Haemophilus"],
+            "vac_polio": ["Vacina polio", "vac_polio", "Polio",
+                          "Vacina poliomielite",
+                          "Vacina inativada poliomielite",
+                          "Vacina inativada poliomielite (VIP)",
+                          "Poliomielite"],
+            "vac_scr": ["Vacina SCR", "vac_scr", "SCR",
+                        "Sarampo, Caxumba, Rubeola",
+                        "Vacina triplice viral", "triplice viral",
+                        "Vacina triplice viral (SCR)"],
+            "vac_pneumo": ["Vacina pneumo", "vac_pneumo", "Pneumococica",
+                           "Vacina pneumococica",
+                           "Vacina pneumo 10",
+                           "Vacina pneumo 10 (VPC10)",
+                           "Pneumococica 10"],
+        },
+        "niveis_prioridade": {
+            0: "EM DIA", 1: "MODERADO", 2: "GRAVE",
+            3: "MUITO GRAVE", 4: "MUITO GRAVE",
+            5: "CRITICO", 6: "CRITICO"
+        },
+        "max_prioridade": 6,
+    },
+    "C3": {
+        "nome": "Gestacao e Puerperio",
+        "num_boas_praticas": 11,
+        "padroes_decisivos": ["dTpa", "puerper", "trimestre",
+                              "12 sem", "pre-natal", "prenatal", "puerperio"],
+        "colunas_detectar": ["dTpa", "HIV", "sifilis", "puerper",
+                             "odontol", "hepatite", "trimestre",
+                             "pre-natal", "prenatal", "gestacao",
+                             "12 sem", "puerperio"],
+        "colunas_excluir": ["hemoglobina glicada", "avaliacao dos pes",
+                            "influenza", "pessoa idosa", "cito", "mamo",
+                            "HPV", "reprodutiva", "mamografia",
+                            "citopatol", "vac_penta", "vac_polio",
+                            "vac_scr", "vac_pneumo", "desenvolvimento infantil",
+                            "puericultura", "30 dias", "gripe",
+                            "penta", "pentavalente", "polio", "pneumo",
+                            "idade em meses"],
+        "colunas_csv": {
+            "nome": ["Nome"],
+            "microarea": ["Microarea"],
+            "data_nascimento": ["Data de nascimento", "Data Nascimento",
+                                "Data de Nascimento", "DtNascimento",
+                                "Data Nasc", "Nascimento"],
+            "idade": ["Idade", "Idade_anos", "Idade do paciente",
+                      "Idade (anos)", "Idade anos", "IDADE"],
+            "qtd_atend_12sem": ["Qtd atendimentos 12sem", "qtd_atend_12sem",
+                                "Quantidade de atendimentos ate 12 semanas",
+                                "Quantidade de atendimentos ate 12 semanas no pre-natal"],
+            "qtd_consultas": ["Qtd consultas", "qtd_consultas",
+                              "Quantidade de consultas",
+                              "Quantidade de atendimentos no pre-natal",
+                              "Quantidade de atendimentos de pre-natal"],
+            "qtd_pa": ["Qtd afericoes PA", "qtd_pa",
+                       "Quantidade de afericoes de pressao arterial",
+                       "Quantidade de afericoes de PA",
+                       "Quantidade de medicoes de pressao arterial",
+                       "Quantidade de medidas de pressao arterial",
+                       "Afericoes de pressao arterial",
+                       "Pressao arterial"],
+            "qtd_antro": ["Qtd antropometrias", "qtd_antro",
+                          "Quantidade de medicoes de peso e altura"],
+            "qtd_visitas": ["Qtd visitas domiciliares", "qtd_visitas",
+                            "Quantidade de visitas domiciliares"],
+            "data_dtpa": ["Data da vacina dTpa", "data_dtpa", "Dias_desde_dTpa"],
+            "exame_hiv_1t": ["Exame HIV 1T", "exame_hiv_1t",
+                             "Exame de HIV no primeiro trimestre"],
+            "exame_sifilis_1t": ["Exame Sifilis 1T", "exame_sifilis_1t",
+                                 "Exame de Sifilis no primeiro trimestre"],
+            "exame_hepb_1t": ["Exame Hepatite B 1T", "exame_hepb_1t",
+                              "Exame de Hepatite B no primeiro trimestre"],
+            "exame_hepc_1t": ["Exame Hepatite C 1T", "exame_hepc_1t",
+                              "Exame de Hepatite C no primeiro trimestre"],
+            "exame_hiv_3t": ["Exame HIV 3T", "exame_hiv_3t",
+                             "Exame de HIV no terceiro trimestre"],
+            "exame_sifilis_3t": ["Exame Sifilis 3T", "exame_sifilis_3t",
+                                 "Exame de Sifilis no terceiro trimestre"],
+            "data_consulta_puerp": ["Data da consulta puerperal",
+                                    "data_consulta_puerp",
+                                    "Dias_desde_consulta_puerp"],
+            "data_visita_puerp": ["Data da visita domiciliar no puerperio",
+                                  "data_visita_puerp",
+                                  "Dias_desde_visita_puerp"],
+            "data_odonto": ["Data da consulta odontologica",
+                            "data_odonto", "Dias_desde_odonto"],
+        },
+        "niveis_prioridade": {
+            0: "EM DIA", 1: "MODERADO", 2: "MODERADO",
+            3: "GRAVE", 4: "GRAVE", 5: "MUITO GRAVE",
+            6: "MUITO GRAVE", 7: "CRITICO", 8: "CRITICO",
+            9: "CRITICO", 10: "CRITICO", 11: "CRITICO"
+        },
+        "max_prioridade": 11,
+    },
+    "C4": {
+        "nome": "Diabetes Mellitus",
+        "num_boas_praticas": 6,
+        "padroes_decisivos": ["hemoglobina glicada", "avaliacao dos pes",
+                              "glicada", "hba1c", "pes diabeticos"],
+        "colunas_detectar": ["hemoglobina glicada", "avaliacao dos pes",
+                             "hemoglobina", "diabetes", "glicada", "hba1c",
+                             "pes diabeticos"],
+        "colunas_excluir": ["influenza", "dTpa", "cito", "mamo", "HPV",
+                            "vac_penta", "vac_polio", "vac_scr", "vac_pneumo",
+                            "puerper", "trimestre", "puericultura",
+                            "citopatol", "mamografia", "reprodutiva",
+                            "pessoa idosa", "desenvolvimento infantil",
+                            "gripe", "hepatite", "sifilis", "hiv"],
+        "colunas_csv": {
+            "nome": ["Nome"],
+            "microarea": ["Microarea"],
+            "data_nascimento": ["Data de nascimento", "Data Nascimento",
+                                "Data de Nascimento", "DtNascimento",
+                                "Data Nasc", "Nascimento"],
+            "idade": ["Idade", "Idade_anos", "Idade do paciente",
+                      "Idade (anos)", "Idade anos", "IDADE"],
+            "data_consulta": ["Data da ultima consulta medica",
+                              "Data da ultima consulta",
+                              "Meses desde a ultima consulta medica",
+                              "Meses desde o ultimo atendimento de enfermagem",
+                              "Meses desde o ultimo atendimento medico"],
+            "data_pa": ["Data da ultima medicao de pressao arterial",
+                        "Data da ultima afericao de PA"],
+            "data_antro": ["Data da ultima medicao de peso e altura",
+                           "Data da ultima antropometria",
+                           "Data da ultima medicao de peso",
+                           "Data de peso e altura", "Antropometria"],
+            "data_hbglicada": ["Data da ultima hemoglobina glicada",
+                               "Data da ultima HbA1c"],
+            "data_pes": ["Data da ultima avaliacao dos pes",
+                         "Data da avaliacao dos pes"],
+            "meses_visita": ["Meses desde a ultima visita domiciliar"],
+            "dias_visita": ["Dias desde a ultima visita domiciliar"],
+            "qtd_visitas": ["Quantidade de visitas domiciliares"],
+        },
+        "niveis_prioridade": {
+            0: "EM DIA", 1: "MODERADO", 2: "GRAVE",
+            3: "MUITO GRAVE", 4: "MUITO GRAVE",
+            5: "CRITICO", 6: "CRITICO"
+        },
+        "max_prioridade": 6,
+    },
+    "C5": {
+        "nome": "Hipertensao Arterial Sistemica",
+        "num_boas_praticas": 4,
+        "padroes_decisivos": [],
+        "colunas_detectar": ["pressao arterial", "medicao de peso e altura",
+                             "visita domiciliar", "hipertensao"],
+        "colunas_excluir": ["hemoglobina", "influenza", "dTpa", "cito",
+                            "mamo", "HPV", "vac_penta", "vac_polio",
+                            "vac_scr", "vac_pneumo", "puerper", "trimestre",
+                            "hepatite", "sifilis", "hiv", "puericultura",
+                            "desenvolvimento infantil", "avaliacao dos pes",
+                            "pessoa idosa", "mamografia", "citopatol",
+                            "reprodutiva", "gripe", "glicada", "hba1c"],
+        "colunas_csv": {
+            "nome": ["Nome"],
+            "microarea": ["Microarea"],
+            "data_nascimento": ["Data de nascimento", "Data Nascimento",
+                                "Data de Nascimento", "DtNascimento",
+                                "Data Nasc", "Nascimento"],
+            "idade": ["Idade", "Idade_anos", "Idade do paciente",
+                      "Idade (anos)", "Idade anos", "IDADE"],
+            "data_consulta": ["Data da ultima consulta medica",
+                              "Data da ultima consulta",
+                              "Meses desde a ultima consulta medica",
+                              "Meses desde o ultimo atendimento de enfermagem",
+                              "Meses desde o ultimo atendimento medico"],
+            "data_pa": ["Data da ultima medicao de pressao arterial",
+                        "Data da ultima afericao de PA"],
+            "data_antro": ["Data da ultima medicao de peso e altura",
+                           "Data da ultima antropometria",
+                           "Data da ultima medicao de peso",
+                           "Data de peso e altura", "Antropometria"],
+            "meses_visita": ["Meses desde a ultima visita domiciliar"],
+            "dias_visita": ["Dias desde a ultima visita domiciliar"],
+            "qtd_visitas": ["Quantidade de visitas domiciliares"],
+        },
+        "niveis_prioridade": {
+            0: "EM DIA", 1: "MODERADO", 2: "GRAVE",
+            3: "MUITO GRAVE", 4: "CRITICO"
+        },
+        "max_prioridade": 4,
+    },
+    "C6": {
+        "nome": "Cuidado da Pessoa Idosa",
+        "num_boas_praticas": 4,
+        "padroes_decisivos": ["influenza", "gripe", "pessoa idosa", "idoso"],
+        "colunas_detectar": ["influenza", "vacina contra influenza",
+                             "pessoa idosa", "idoso", "vacina influenza",
+                             "gripe", "vacinacao influenza",
+                             "imunizacao influenza"],
+        "colunas_excluir": ["hemoglobina glicada", "avaliacao dos pes",
+                            "dTpa", "HIV", "sifilis", "hepatite",
+                            "trimestre", "cito", "mamo", "HPV",
+                            "reprodutiva", "mamografia", "citopatol",
+                            "vac_penta", "vac_polio", "vac_scr",
+                            "vac_pneumo", "puerper", "puericultura",
+                            "desenvolvimento infantil", "pre-natal",
+                            "30 dias", "idade_meses", "glicada", "hba1c"],
+        "colunas_csv": {
+            "nome": ["Nome"],
+            "microarea": ["Microarea"],
+            "data_nascimento": ["Data de nascimento", "Data Nascimento",
+                                "Data de Nascimento", "DtNascimento",
+                                "Data Nasc", "Nascimento"],
+            "idade": ["Idade", "Idade_anos", "Idade do paciente",
+                      "Idade (anos)", "Idade anos", "IDADE"],
+            "data_consulta": ["Data da ultima consulta medica",
+                              "Meses desde o ultimo atendimento medico",
+                              "Meses desde a ultima consulta medica",
+                              "Meses desde o ultimo atendimento de enfermagem",
+                              "Data da ultima consulta"],
+            "data_antro": ["Data da ultima medicao de peso e altura",
+                           "Data da ultima antropometria",
+                           "Data da ultima medicao de peso",
+                           "Data de peso e altura", "Antropometria"],
+            "data_influenza": ["Influenza (ultimos 12 meses)", "Influenza",
+                               "Vacina influenza", "influenza"],
+            "meses_visita": ["Meses desde a ultima visita domiciliar"],
+            "dias_visita": ["Dias desde a ultima visita domiciliar"],
+            "qtd_visitas": ["Quantidade de visitas domiciliares"],
+        },
+        "niveis_prioridade": {
+            0: "EM DIA", 1: "MODERADO", 2: "GRAVE",
+            3: "MUITO GRAVE", 4: "CRITICO"
+        },
+        "max_prioridade": 4,
+    },
+    "C7": {
+        "nome": "Prevencao do Cancer",
+        "num_boas_praticas": 4,
+        "padroes_decisivos": ["cito", "mamo", "HPV", "mamografia",
+                              "citopatol", "reprodutiva",
+                              "colpocitologico", "cancer",
+                              "rastreamento de cancer de mama",
+                              "cancer de mama"],
+        "colunas_detectar": ["cito", "mamo", "HPV", "reprodutiva",
+                             "citopatol", "mamografia", "colpocitologico",
+                             "cancer", "rastreamento",
+                             "rastreamento de cancer de mama",
+                             "cancer de mama"],
+        "colunas_excluir": ["hemoglobina glicada", "avaliacao dos pes",
+                            "influenza", "dTpa", "HIV", "sifilis",
+                            "hepatite", "trimestre", "puerper",
+                            "vac_penta", "vac_polio", "vac_scr",
+                            "vac_pneumo", "puericultura", "pessoa idosa",
+                            "desenvolvimento infantil", "pre-natal",
+                            "30 dias", "idade_meses", "glicada", "hba1c",
+                            "gripe"],
+        "colunas_csv": {
+            "nome": ["Nome"],
+            "microarea": ["Microarea"],
+            "data_nascimento": ["Data de nascimento", "Data Nascimento",
+                                "Data de Nascimento", "DtNascimento",
+                                "Data Nasc", "Nascimento"],
+            "idade": ["Idade", "Idade_anos", "Idade do paciente",
+                      "Idade (anos)", "Idade anos", "IDADE"],
+            "data_cito": ["Data do ultimo citopatologico",
+                          "Dias_desde_cito", "Data da ultima citologia",
+                          "Rastreamento de cancer de colo uterino",
+                          "Data do Papanicolau", "Papanicolau",
+                          "Preventivo", "Data do Preventivo",
+                          "Exame de rastreamento de cancer de colo de utero data ultima solicitacao",
+                          "Exame de rastreamento de cancer de colo de utero data ultima avaliacao"],
+            "data_hpv": ["Data da vacina HPV", "Dias_desde_hpv"],
+            "data_ssr": ["Data da ultima consulta em saude reprodutiva",
+                         "Dias_desde_ssr", "Data saude sexual reprodutiva"],
+            "data_mamo": ["Exame de rastreamento de cancer de mama data Ultima solicitacao",
+                          "Exame de rastreamento de cancer de mama data Ultima realizacao",
+                          "Exame de rastreamento de cancer de mama data Ultima avaliacao",
+                          "Data da ultima mamografia",
+                          "Dias_desde_mamo",
+                          "Data da mamografia"]
+        },
+        "niveis_prioridade": {
+            0: "EM DIA", 1: "MODERADO", 2: "GRAVE",
+            3: "MUITO GRAVE", 4: "CRITICO"
+        },
+        "max_prioridade": 4
+    }
+}
+
+CALENDARIO_VACINAL_C2 = {
+    "penta": {
+        "nome": "Pentavalente (Difteria, Tetano, Coqueluche, Hepatite B, Hib)",
+        "doses_esperadas": 3,
+        "idades_doses": [2, 4, 6],
+        "codigos": ["09", "17", "29", "39", "42", "43", "46", "47", "58"],
+    },
+    "polio": {
+        "nome": "Poliomielite (VIP)",
+        "doses_esperadas": 3,
+        "idades_doses": [2, 4, 6],
+        "codigos": ["22", "29", "43", "58"],
+    },
+    "pneumo": {
+        "nome": "Pneumococica (VPC10/VPC13/VPC15/VPC20)",
+        "doses_esperadas": 2,
+        "idades_doses": [2, 4],
+        "codigos": ["26", "59", "106", "107"],
+    },
+    "scr": {
+        "nome": "Sarampo, Caxumba, Rubeola (SCR/SCRV)",
+        "doses_esperadas": 2,
+        "idades_doses": [12, 15],
+        "codigos": ["24", "56"],
+        "observacao": "Doses registradas antes dos 12 meses NAO sao consideradas validas",
+    },
+}
+
+
+# ============================================================
+# --- 3. DETECCAO AUTOMATICA DO INDICADOR ---
+# ============================================================
+
+def _preparar_padroes(config):
+    return {
+        "decisivos": [_normalizar_texto(p) for p in config.get("padroes_decisivos", [])],
+        "regulares": [_normalizar_texto(p) for p in config.get("colunas_detectar", [])],
+        "excluir": [_normalizar_texto(p) for p in config.get("colunas_excluir", [])],
+    }
+
+
+_PADROES_NORMALIZADOS = {
+    codigo: _preparar_padroes(config) for codigo, config in INDICADORES.items()
+}
+
+
+def detectar_indicador(colunas_csv, verbose=True):
+    """Identifica o indicador (C2..C7) a partir das colunas do CSV."""
+    colunas_norm = [_normalizar_texto(c) for c in colunas_csv]
+    scores = {}
+    detalhes = {}
+
+    for codigo, padroes in _PADROES_NORMALIZADOS.items():
+        decisivos = sum(
+            10 for p in padroes["decisivos"]
+            if p and any(p in col for col in colunas_norm)
+        )
+        regulares = sum(
+            1 for p in padroes["regulares"]
+            if p and any(p in col for col in colunas_norm)
+        )
+        penalidades = sum(
+            -5 for p in padroes["excluir"]
+            if p and any(p in col for col in colunas_norm)
+        )
+        scores[codigo] = decisivos + regulares + penalidades
+        detalhes[codigo] = {
+            "decisivos": decisivos,
+            "regulares": regulares,
+            "penalidades": penalidades,
+            "total": scores[codigo],
+        }
+
+    melhor = max(scores, key=scores.get)
+
+    if verbose:
+        print("=" * 70)
+        print("  DETECCAO AUTOMATICA DE INDICADOR")
+        print(f"  Colunas no CSV: {len(colunas_csv)}")
+        print("=" * 70)
+        print(f"  {'Indicador':<40} {'Decis.':>6} {'Regul.':>6} {'Penal.':>6} {'TOTAL':>6}")
+        print("  " + "-" * 68)
+        for codigo in sorted(scores):
+            d = detalhes[codigo]
+            marca = " <<< SELECIONADO" if codigo == melhor else ""
+            print(
+                f"  {codigo} - {INDICADORES[codigo]['nome']:<34} "
+                f"{d['decisivos']:>5}  {d['regulares']:>5}  "
+                f"{d['penalidades']:>5}  {d['total']:>5}{marca}"
+            )
+
+    if scores[melhor] <= 0:
+        if verbose:
+            print("\n  AVISO: Nenhum indicador teve score positivo!")
+            print("  Colunas do CSV (normalizadas):")
+            for c in colunas_norm:
+                print(f"    - {c}")
+        raise ValueError(
+            "Nao foi possivel detectar o indicador. "
+            "Verifique se o CSV contem as colunas esperadas."
+        )
+
+    if verbose:
+        print(f"\n  INDICADOR DETECTADO: {melhor} - {INDICADORES[melhor]['nome']}")
+        print("=" * 70 + "\n")
+    return melhor
+
+
+# ============================================================
+# --- 4. CARREGAMENTO DO CSV ---
+# ============================================================
+
+_ENCODINGS = ("utf-8-sig", "utf-8", "cp1252", "iso-8859-1", "latin-1")
+
+
+def ler_conteudo_csv(caminho_ou_buffer):
+    """Le bytes e identifica o encoding. Retorna (texto, encoding, bytes)."""
+    if hasattr(caminho_ou_buffer, "read"):
+        try:
+            caminho_ou_buffer.seek(0)
+        except (OSError, ValueError):
+            pass
+        conteudo = caminho_ou_buffer.read()
+        if isinstance(conteudo, str):
+            conteudo = conteudo.encode("latin-1", errors="ignore")
+        try:
+            caminho_ou_buffer.seek(0)
+        except (OSError, ValueError):
+            pass
+    else:
+        with open(caminho_ou_buffer, "rb") as arquivo:
+            conteudo = arquivo.read()
+
+    if not conteudo:
+        raise ValueError("O arquivo CSV esta vazio.")
+
+    for encoding in _ENCODINGS:
+        try:
+            return conteudo.decode(encoding), encoding, conteudo
+        except UnicodeDecodeError:
+            continue
+    raise ValueError("Nao foi possivel identificar o encoding do arquivo CSV.")
+
+
+def separar_linha_csv(linha, delimitador):
+    """Divide uma linha respeitando campos entre aspas."""
+    try:
+        return next(csv.reader(
+            [linha],
+            delimiter=delimitador,
+            quotechar='"',
+            doublequote=True,
+            skipinitialspace=True,
+        ))
+    except (csv.Error, StopIteration):
+        return []
+
+
+def detectar_skiprows(caminho_ou_buffer, verbose=True):
+    """Identifica quantas linhas devem ser ignoradas antes do cabecalho."""
+    texto, encoding, _ = ler_conteudo_csv(caminho_ou_buffer)
+    linhas = texto.splitlines()
+    if not linhas:
+        return 0
+
+    for numero_linha, linha in enumerate(linhas[:100]):
+        if not linha.strip():
+            continue
+        for delimitador in (";", ",", "\t"):
+            campos = [c.strip() for c in separar_linha_csv(linha, delimitador)]
+            if len(campos) < 3 or sum(bool(c) for c in campos) < 3:
+                continue
+
+            compativeis = 0
+            indice = numero_linha + 1
+            while indice < len(linhas) and compativeis < 5:
+                proxima = linhas[indice]
+                if not proxima.strip():
+                    indice += 1
+                    continue
+                if len(separar_linha_csv(proxima, delimitador)) == len(campos):
+                    compativeis += 1
+                    indice += 1
+                else:
+                    break
+
+            if compativeis >= 2:
+                if verbose:
+                    print("Estrutura detectada:")
+                    print(f"   Encoding: {encoding}")
+                    print(f"   Skiprows: {numero_linha}")
+                    print(f"   Delimitador provavel: {delimitador!r}")
+                    print(f"   Numero de colunas: {len(campos)}")
+                return numero_linha
+
+    for numero_linha, linha in enumerate(linhas[:100]):
+        if len(separar_linha_csv(linha, ";")) >= 3:
+            return numero_linha
+    return 0
+
+
+def detectar_delimitador(caminho_ou_buffer, skiprows):
+    """Detecta se o CSV usa ';', ',' ou tabulacao."""
+    texto, _, _ = ler_conteudo_csv(caminho_ou_buffer)
+    linhas = texto.splitlines()
+    if not linhas or skiprows >= len(linhas):
+        return ";"
+
+    cabecalho = linhas[skiprows]
+    contagem = {
+        d: len(separar_linha_csv(cabecalho, d)) for d in (";", ",", "\t")
+    }
+    escolhido = max(contagem, key=contagem.get)
+    return escolhido if contagem[escolhido] >= 2 else ";"
+
+
+def validar_dataframe(df):
+    """Limpeza inicial segura do DataFrame."""
+    if df is None:
+        raise ValueError("O DataFrame nao foi carregado.")
+    if df.empty:
+        raise ValueError("O CSV foi lido, mas nao possui registros.")
+
+    df = df.dropna(axis=1, how="all").copy()
+    df.columns = [str(c).strip() for c in df.columns]
+
+    for coluna in df.columns:
+        if df[coluna].dtype == "object":
+            df[coluna] = df[coluna].map(
+                lambda v: v.strip() if isinstance(v, str) else v
+            )
+    return df
+
+
+def carregar_csv(caminho=None):
+    """Carrega o CSV do e-SUS APS."""
+    if caminho is None:
+        caminho = os.environ.get("CSV_PATH") or input(
+            "Caminho do arquivo .csv do e-SUS APS: "
+        ).strip()
+
+    if not str(caminho).lower().endswith(".csv"):
+        raise ValueError("O arquivo informado nao possui extensao .csv.")
+
+    nome_arquivo = Path(caminho).name
+    texto, encoding, _ = ler_conteudo_csv(caminho)
+    skiprows = detectar_skiprows(caminho)
+    delimitador = detectar_delimitador(caminho, skiprows)
+
+    try:
+        df = pd.read_csv(
+            io.StringIO(texto),
+            sep=delimitador,
+            skiprows=skiprows,
+            header=0,
+            quotechar='"',
+            doublequote=True,
+            dtype=str,
+            engine="python",
+            on_bad_lines="warn",
+            keep_default_na=False,
+            na_filter=False,
+        )
+    except Exception as erro:
+        raise ValueError(
+            "\nNao foi possivel carregar o CSV.\n"
+            f"Arquivo: {nome_arquivo}\n"
+            f"Encoding: {encoding}\n"
+            f"Delimitador: {delimitador!r}\n"
+            f"Skiprows: {skiprows}\n"
+            f"Erro: {erro}"
+        ) from erro
+
+    df = validar_dataframe(df)
+
+    print("\nArquivo carregado com sucesso:")
+    print(f"   Arquivo: {nome_arquivo}")
+    print(f"   Encoding: {encoding}")
+    print(f"   Delimitador: {delimitador!r}")
+    print(f"   Skiprows: {skiprows}")
+    print(f"   Linhas: {len(df)}")
+    print(f"   Colunas: {len(df.columns)}")
+    print("\nColunas identificadas:")
+    for numero, coluna in enumerate(df.columns, start=1):
+        print(f"   {numero}. {coluna}")
+    print("\nPrimeiras linhas:")
+    print(df.head().to_string())
+
+    return df, nome_arquivo
+
+
+# ============================================================
+# --- 5. PREPARACAO DOS DADOS ---
+# ============================================================
+
+def _calcular_idade_data_nasc(data_nasc):
+    """Calcula idade em anos a partir da data de nascimento."""
+    data = _parse_data(data_nasc)
+    if data is None or pd.isna(data):
+        return 0.0
+    hoje = datetime.now()
+    idade = hoje.year - data.year
+    if (hoje.month, hoje.day) < (data.month, data.day):
+        idade -= 1
+    return float(idade) if 0 <= idade <= 130 else 0.0
+
+
+_PALAVRAS_CHAVE = {
+    "peso e altura": ["peso", "altura", "antropometr"],
+    "pressao arterial": ["pressao", "arterial"],
+    "consulta": ["consulta", "atendimento"],
+    "visita": ["visita", "domiciliar"],
+    "hemoglobina": ["hemoglobina", "glicada", "hba1c"],
+    "influenza": ["influenza", "gripe"],
+    "cito": ["cito", "citopat", "colpo"],
+    "mamo": ["mamo", "mama", "rastreamento de cancer de mama"],
+    "hpv": ["hpv"],
+    "reprodutiva": ["reprodut", "sexual"],
+    "dtpa": ["dtpa", "triplice"],
+    "hiv": ["hiv"],
+    "sifilis": ["sifilis", "vdrl"],
+    "hepatite": ["hepatite", "hep"],
+    "puerperal": ["puerp"],
+    "odontologica": ["odont"],
+    "microarea": ["microarea", "micro"],
+    "nome": ["nome", "paciente"],
+    "idade": ["idade"],
+    "data_nascimento": ["nascimento", "dtnascimento", "data nasc"],
+    "scr": ["scr", "sarampo", "caxumba", "rubeola", "triplice viral"],
+    "pneumo": ["pneumo", "pneumococica", "vpc10"],
+    "penta": ["penta", "pentavalente", "dtp", "hib"],
+    "polio": ["polio", "poliomielite", "vip"],
+}
+
+
+def encontrar_coluna(df, candidatos):
+    """Encontra coluna no DataFrame com normalizacao de acentos."""
+    colunas_norm = {_normalizar_texto(str(c)): c for c in df.columns}
+    candidatos_norm = [_normalizar_texto(c) for c in candidatos]
+
+    for cand in candidatos_norm:
+        if cand in colunas_norm:
+            return colunas_norm[cand]
+
+    for cand in candidatos_norm:
+        if not cand:
+            continue
+        for col_norm, col_orig in colunas_norm.items():
+            if cand in col_norm:
+                return col_orig
+
+    for cand in candidatos_norm:
+        for variacoes in _PALAVRAS_CHAVE.values():
+            for var in variacoes:
+                var_norm = _normalizar_texto(var)
+                if var_norm and var_norm in cand:
+                    for col_norm, col_orig in colunas_norm.items():
+                        if var_norm in col_norm:
+                            return col_orig
+    return None
+
+
+def preparar_dados(df, codigo_indicador):
+    """Prepara os dados conforme o indicador detectado."""
+    config = INDICADORES[codigo_indicador]
+    colunas_mapeadas = {}
+
+    print("\n   Mapeamento de colunas:")
+    print("   " + "-" * 50)
+    for chave, candidatos in config["colunas_csv"].items():
+        coluna = encontrar_coluna(df, candidatos)
+        if coluna is not None:
+            colunas_mapeadas[chave] = coluna
+            print(f"   [OK] {chave:<25} -> '{coluna}'")
+        else:
+            print(f"   [--] {chave:<25} -> NAO ENCONTRADA")
+
+    nome_col = colunas_mapeadas.get("nome", df.columns[0])
+    microarea_col = colunas_mapeadas.get(
+        "microarea", df.columns[1] if len(df.columns) > 1 else df.columns[0]
+    )
+
+    dados = pd.DataFrame(index=df.index)
+    dados["Nome"] = df[nome_col].astype(str).str.strip()
+    dados["Microarea"] = df[microarea_col].astype(str).str.strip()
+
+    data_nasc_col = colunas_mapeadas.get("data_nascimento")
+
+    if codigo_indicador == "C2":
+        idade_col = colunas_mapeadas.get("idade_meses")
+        if data_nasc_col:
+            dados["Idade"] = df[data_nasc_col].map(_calcular_idade_data_nasc)
+            dados["Idade_meses"] = (dados["Idade"] * 12).round(0).astype(int)
+            print("   Idade calculada a partir da data de nascimento")
+        elif idade_col:
+            dados["Idade_meses"] = df[idade_col].map(_extrair_meses)
+            dados["Idade"] = (dados["Idade_meses"] / 12).round(1)
+            print("   Idade extraida da coluna meses")
+        else:
+            dados["Idade_meses"] = 0
+            dados["Idade"] = 0
+            print("   AVISO: Idade nao encontrada - usando 0")
+    else:
+        idade_col = colunas_mapeadas.get("idade")
+        if data_nasc_col:
+            dados["Idade"] = df[data_nasc_col].map(_calcular_idade_data_nasc)
+            print("   Idade calculada a partir da data de nascimento")
+        elif idade_col:
+            dados["Idade"] = df[idade_col].map(_parse_idade)
+            print("   Idade extraida da coluna de idade")
+        else:
+            dados["Idade"] = 0
+            print("   AVISO: Idade nao encontrada - usando 0")
+
+    if data_nasc_col:
+        dados["Data_Nascimento"] = df[data_nasc_col]
+
+    ignorar = {"nome", "microarea", "idade", "idade_meses", "data_nascimento"}
+    for chave, col_orig in colunas_mapeadas.items():
+        if chave not in ignorar:
+            dados[chave] = df[col_orig]
+
+    print(f"\n   Colunas mapeadas: {len(colunas_mapeadas)}")
+    print(f"   Amostra de idades: {dados['Idade'].head(10).tolist()}")
+    return dados, colunas_mapeadas
+
+
+# ============================================================
+# --- 6. BOAS PRATICAS POR INDICADOR ---
+# ============================================================
+
+def definir_boas_praticas(codigo_indicador):
+    """Retorna a lista de boas praticas (criterios) do indicador."""
+    if codigo_indicador == "C2":
+        return [
+            {"label": "Atendimento nos primeiros 30 dias de vida",
+             "chave": "qtd_atend_30d", "tipo": "quantidade", "minimo": 1,
+             "descricao_prazo": "Nos primeiros 30 dias"},
+            {"label": "Consultas de puericultura",
+             "chave": "qtd_consultas", "tipo": "quantidade", "minimo": 1,
+             "descricao_prazo": "Minimo 1 consulta"},
+            {"label": "Antropometria (peso e altura)",
+             "chave": "data_antro", "tipo": "data_e_quantidade",
+             "max_dias": 60,
+             "chave_qtd": "qtd_antro", "minimo": 1,
+             "idade_max": 2,
+             "descricao_prazo": "Ultima medicao ha ate 60 dias - criancas ate 24 meses"},
+            {"label": "Quantidade de medicoes de peso/altura simultaneas ate 24 meses",
+             "chave": "qtd_antro", "tipo": "quantidade", "minimo": 1,
+             "idade_max": 2,
+             "descricao_prazo": "Minimo 1 medicao - criancas ate 24 meses"},
+            {"label": "Visitas domiciliares do ACS",
+             "chave": "qtd_visitas", "tipo": "quantidade", "minimo": 1,
+             "descricao_prazo": "Minimo 1 visita"},
+            {"label": "Vacinacao (Penta, Polio, SCR, Pneumo)",
+             "chave": "vacinas", "tipo": "vacinas_multiplas",
+             "vacinas": ["vac_penta", "vac_polio", "vac_scr", "vac_pneumo"],
+             "descricao_prazo": "Esquema vacinal completo"},
+        ]
+    if codigo_indicador == "C3":
+        return [
+            {"label": "Atendimento ate 12 semanas no pre-natal",
+             "chave": "qtd_atend_12sem", "tipo": "quantidade", "minimo": 1,
+             "descricao_prazo": "Minimo 1 atendimento ate 12 semanas"},
+            {"label": "7+ atendimentos no pre-natal",
+             "chave": "qtd_consultas", "tipo": "quantidade", "minimo": 7,
+             "descricao_prazo": "Minimo 7 atendimentos no pre-natal"},
+            {"label": "7+ afericoes de pressao arterial",
+             "chave": "qtd_pa", "tipo": "quantidade", "minimo": 7,
+             "descricao_prazo": "Minimo 7 afericoes"},
+            {"label": "7+ medicoes de peso e altura (antropometria)",
+             "chave": "qtd_antro", "tipo": "quantidade", "minimo": 7,
+             "descricao_prazo": "Minimo 7 medicoes"},
+            {"label": "3+ visitas domiciliares apos 1a consulta",
+             "chave": "qtd_visitas", "tipo": "quantidade", "minimo": 3,
+             "descricao_prazo": "Minimo 3 visitas"},
+            {"label": "Vacina dTpa (a partir da 20a semana)",
+             "chave": "data_dtpa", "tipo": "data", "max_dias": 280,
+             "descricao_prazo": "A partir da 20a semana"},
+            {"label": "Exames 1o trimestre (HIV, Sifilis, Hep B, Hep C)",
+             "chave": "exames_1t", "tipo": "exames_multiplos",
+             "exames": ["exame_hiv_1t", "exame_sifilis_1t",
+                        "exame_hepb_1t", "exame_hepc_1t"],
+             "descricao_prazo": "No 1o trimestre"},
+            {"label": "Exames 3o trimestre (HIV, Sifilis)",
+             "chave": "exames_3t", "tipo": "exames_multiplos",
+             "exames": ["exame_hiv_3t", "exame_sifilis_3t"],
+             "descricao_prazo": "No 3o trimestre"},
+            {"label": "Consulta puerperal",
+             "chave": "data_consulta_puerp", "tipo": "data", "max_dias": 180,
+             "descricao_prazo": "Ate 180 dias (6 meses)"},
+            {"label": "Visita domiciliar no puerperio",
+             "chave": "data_visita_puerp", "tipo": "data", "max_dias": 180,
+             "descricao_prazo": "Ate 180 dias (6 meses)"},
+            {"label": "Consulta odontologica na gestacao",
+             "chave": "data_odonto", "tipo": "data", "max_dias": 365,
+             "descricao_prazo": "Ate 365 dias (12 meses)"},
+        ]
+    if codigo_indicador == "C4":
+        return [
+            {"label": "Consulta medica/enfermagem",
+             "chave": "data_consulta", "tipo": "data_ou_meses", "max_dias": 180,
+             "descricao_prazo": "Ultimos 6 meses (180 dias)"},
+            {"label": "Afericao de pressao arterial",
+             "chave": "data_pa", "tipo": "data", "max_dias": 180,
+             "descricao_prazo": "Ultimos 6 meses (180 dias)"},
+            {"label": "Antropometria (peso e altura)",
+             "chave": "data_antro", "tipo": "data", "max_dias": 365,
+             "descricao_prazo": "Ultimos 12 meses (365 dias)"},
+            {"label": "2+ visitas domiciliares do ACS",
+             "chave": "qtd_visitas", "tipo": "quantidade", "minimo": 2,
+             "descricao_prazo": "Minimo 2 visitas nos ultimos 12 meses"},
+            {"label": "Hemoglobina glicada solicitada/avaliada",
+             "chave": "data_hbglicada", "tipo": "data", "max_dias": 365,
+             "descricao_prazo": "Ultimos 12 meses (365 dias)"},
+            {"label": "Avaliacao dos pes",
+             "chave": "data_pes", "tipo": "data", "max_dias": 365,
+             "descricao_prazo": "Ultimos 12 meses (365 dias)"},
+        ]
+    if codigo_indicador == "C5":
+        return [
+            {"label": "Consulta medica/enfermagem",
+             "chave": "data_consulta", "tipo": "data_ou_meses", "max_dias": 180,
+             "descricao_prazo": "Ultimos 6 meses (180 dias)"},
+            {"label": "Afericao de pressao arterial",
+             "chave": "data_pa", "tipo": "data", "max_dias": 180,
+             "descricao_prazo": "Ultimos 6 meses (180 dias)"},
+            {"label": "Antropometria (peso e altura)",
+             "chave": "data_antro", "tipo": "data", "max_dias": 365,
+             "descricao_prazo": "Ultimos 12 meses (365 dias)"},
+            {"label": "2+ visitas domiciliares do ACS",
+             "chave": "qtd_visitas", "tipo": "quantidade", "minimo": 2,
+             "descricao_prazo": "Minimo 2 visitas nos ultimos 12 meses"},
+        ]
+    if codigo_indicador == "C6":
+        return [
+            {"label": "Consulta medica/enfermagem",
+             "chave": "data_consulta", "tipo": "data_ou_meses", "max_dias": 365,
+             "descricao_prazo": "Ultimos 12 meses (365 dias)"},
+            {"label": "Antropometria (peso e altura)",
+             "chave": "data_antro", "tipo": "data", "max_dias": 365,
+             "descricao_prazo": "Ultimos 12 meses (365 dias)"},
+            {"label": "2+ visitas domiciliares do ACS",
+             "chave": "qtd_visitas", "tipo": "quantidade", "minimo": 2,
+             "descricao_prazo": "Minimo 2 visitas nos ultimos 12 meses"},
+            {"label": "Vacinacao contra Influenza", "chave": "influenza",
+             "tipo": "texto_vacina",
+             "descricao_prazo": "Vacina aplicada nos ultimos 12 meses"},
+        ]
+    if codigo_indicador == "C7":
+        return [
+            {"label": "Citopatologico", "chave": "data_cito",
+             "tipo": "data", "max_dias": 1095,
+             "idade_min": 25, "idade_max": 64,
+             "descricao_prazo": "3 anos - mulheres 25-64 anos"},
+            {"label": "Vacina HPV", "chave": "data_hpv",
+             "tipo": "data", "max_dias": 3650,
+             "idade_min": 9, "idade_max": 14,
+             "descricao_prazo": "Esquema completo - 9-14 anos"},
+            {"label": "Saude sexual e reprodutiva", "chave": "data_ssr",
+             "tipo": "data", "max_dias": 365,
+             "idade_min": 14, "idade_max": 69,
+             "descricao_prazo": "12 meses - 14-69 anos"},
+            {"label": "Rastreamento de cancer de mama (mamografia)",
+             "chave": "data_mamo", "tipo": "data", "max_dias": 730,
+             "idade_min": 50, "idade_max": 69,
+             "descricao_prazo": "2 anos - mulheres 50-69 anos"},
+        ]
+    return []
+
+
+def parse_doses_vacina(valor_coluna):
+    """Faz o parse da coluna de vacina do CSV."""
+    if pd.isna(valor_coluna) or str(valor_coluna).strip() in ("", "nan", "None"):
+        return {}
+    texto = str(valor_coluna).strip()
+    doses_encontradas = {}
+    padrao_dose = re.compile(r"D(\d+)\s*[-\u2013]\s*", re.IGNORECASE)
+    matches = list(padrao_dose.finditer(texto))
+    for i, match in enumerate(matches):
+        dose_num = int(match.group(1))
+        inicio = match.end()
+        fim = matches[i + 1].start() if i + 1 < len(matches) else len(texto)
+        descricao = texto[inicio:fim].strip().rstrip(",").strip()
+        doses_encontradas[dose_num] = descricao
+    return doses_encontradas
+
+
+# ============================================================
+# --- 7. VERIFICACAO DE CRITERIOS ---
+# ============================================================
+
+def _verificar_criterio_detalhado(linha, pratica, colunas, codigo_indicador):
+    """Verifica se um criterio foi atendido para um paciente."""
+    chave = pratica["chave"]
+    tipo = pratica["tipo"]
+    label = pratica["label"]
+    hoje = datetime.now()
+
+    idade_min = pratica.get("idade_min")
+    idade_max = pratica.get("idade_max")
+    if idade_min is not None or idade_max is not None:
+        try:
+            idade = float(linha.get("Idade", 0) or 0)
+        except (TypeError, ValueError):
+            idade = 0.0
+        if idade > 0:
+            if idade_min is not None and idade_max is not None:
+                faixa = f"{idade_min}-{idade_max} anos"
+            elif idade_min is not None:
+                faixa = f"{idade_min}+ anos"
+            else:
+                faixa = f"ate {idade_max} anos"
+            if idade_min is not None and idade < idade_min:
+                return False, (
+                    f"{label} - Nao se aplica (paciente tem {idade:.0f} anos, "
+                    f"faixa: {faixa})"
+                ), True
+            if idade_max is not None and idade > idade_max:
+                return False, (
+                    f"{label} - Nao se aplica (paciente tem {idade:.0f} anos, "
+                    f"faixa: {faixa})"
+                ), True
+
+    prazo = pratica.get("descricao_prazo", "")
+
+    if tipo == "quantidade":
+        if chave not in colunas:
+            return True, f"{label} - dados nao encontrados no CSV", False
+        valor = pd.to_numeric(linha[chave], errors="coerce")
+        minimo = pratica["minimo"]
+        if pd.isna(valor) or valor == 0:
+            return True, (
+                f"{label} - NENHUMA realizacao registrada "
+                f"(0 de {minimo} esperado). Prazo: {prazo}"
+            ), False
+        if valor < minimo:
+            return True, (
+                f"{label} - Realizadas: {int(valor)} de {minimo} esperado. "
+                f"Prazo: {prazo}"
+            ), False
+        return False, (
+            f"{label} - Adequado. Realizadas: {int(valor)} de {minimo} "
+            f"esperado. Prazo: {prazo}"
+        ), False
+
+    if tipo == "data_e_quantidade":
+        qtd_chave = pratica.get("chave_qtd", chave)
+        max_dias = pratica["max_dias"]
+        minimo = pratica["minimo"]
+        problemas = []
+        data_ok_str = ""
+        qtd_ok_str = ""
+
+        if chave not in colunas:
+            problemas.append("coluna de data nao encontrada no CSV")
+        else:
+            valor_data = linha[chave]
+            if not _valor_valido(valor_data):
+                problemas.append("NENHUMA data de medicao registrada")
+            else:
+                data = _parse_data(valor_data)
+                if data is not None and not pd.isna(data):
+                    dias = (hoje - data).days
+                    if dias > max_dias:
+                        problemas.append(
+                            f"ultima medicao: {data.strftime('%d/%m/%Y')} "
+                            f"({dias} dias atras, limite: {max_dias} dias)"
+                        )
+                    else:
+                        data_ok_str = (
+                            f"{data.strftime('%d/%m/%Y')} ({dias} dias atras)"
+                        )
+                else:
+                    dias_val = _para_numero(valor_data)
+                    if dias_val is None:
+                        problemas.append(f"data invalida: '{valor_data}'")
+                    elif dias_val > max_dias:
+                        problemas.append(
+                            f"ultima medicao ha {int(dias_val)} dias "
+                            f"(limite: {max_dias} dias)"
+                        )
+                    else:
+                        data_ok_str = f"{int(dias_val)} dias atras"
+
+        if qtd_chave not in colunas:
+            problemas.append("coluna de quantidade nao encontrada no CSV")
+        else:
+            valor_qtd = pd.to_numeric(linha[qtd_chave], errors="coerce")
+            if pd.isna(valor_qtd) or valor_qtd == 0:
+                problemas.append(f"NENHUMA medicao registrada (minimo: {minimo})")
+            elif valor_qtd < minimo:
+                problemas.append(
+                    f"apenas {int(valor_qtd)} medicao(oes) (minimo: {minimo})"
+                )
+            else:
+                qtd_ok_str = f"{int(valor_qtd)} medicao(oes)"
+
+        if problemas:
+            return True, f"{label} - " + "; ".join(problemas) + f". Prazo: {prazo}", False
+        return False, f"{label} - Adequado. Ultima: {data_ok_str}, {qtd_ok_str}", False
+
+    if tipo == "data":
+        if chave not in colunas:
+            return True, f"{label} - coluna de data nao encontrada no CSV", False
+        valor = linha[chave]
+        if not _valor_valido(valor):
+            return True, f"{label} - NENHUMA data registrada. Prazo: {prazo}", False
+
+        max_dias = pratica["max_dias"]
+        data = _parse_data(valor)
+        if data is not None and not pd.isna(data):
+            dias = (hoje - data).days
+            if dias > max_dias:
+                return True, (
+                    f"{label} - Ultima data: {data.strftime('%d/%m/%Y')} "
+                    f"({dias} dias atras). Limite: {max_dias} dias. Prazo: {prazo}"
+                ), False
+            return False, (
+                f"{label} - Adequado. Ultima data: "
+                f"{data.strftime('%d/%m/%Y')} ({dias} dias atras)"
+            ), False
+
+        dias_valor = _para_numero(valor)
+        if dias_valor is None:
+            return True, (
+                f"{label} - Data invalida ou ilegivel: '{valor}'. Prazo: {prazo}"
+            ), False
+        if dias_valor > max_dias:
+            return True, (
+                f"{label} - Ultimo registro ha {int(dias_valor)} dias. "
+                f"Limite: {max_dias} dias. Prazo: {prazo}"
+            ), False
+        return False, f"{label} - Adequado ({int(dias_valor)} dias atras)", False
+
+    if tipo == "data_ou_meses":
+        if chave not in colunas:
+            return True, f"{label} - coluna nao encontrada no CSV", False
+
+        chave_lower = chave.lower()
+        col_dias = col_meses = None
+        if "meses" in chave_lower:
+            col_meses = chave
+            candidata = chave_lower.replace("meses", "dias")
+            col_dias = candidata if candidata in colunas else None
+        elif "dias" in chave_lower:
+            col_dias = chave
+            candidata = chave_lower.replace("dias", "meses")
+            col_meses = candidata if candidata in colunas else None
+        else:
+            col_meses = chave
+
+        valor = linha[chave]
+        if not _valor_valido(valor):
+            return True, f"{label} - NENHUM registro encontrado. Prazo: {prazo}", False
+
+        max_dias = pratica["max_dias"]
+        data = _parse_data(valor)
+        if data is not None and not pd.isna(data):
+            dias = (hoje - data).days
+            if dias > max_dias:
+                return True, (
+                    f"{label} - Ultima data: {data.strftime('%d/%m/%Y')} "
+                    f"({dias} dias atras). Limite: {max_dias} dias. Prazo: {prazo}"
+                ), False
+            return False, (
+                f"{label} - Adequado. Ultima data: "
+                f"{data.strftime('%d/%m/%Y')} ({dias} dias atras)"
+            ), False
+
+        dias, origem = _obter_dias_de_colunas(linha, col_dias, col_meses)
+        if dias is None:
+            return False, (
+                "Nao foi possivel determinar o periodo do criterio: "
+                "coluna de dias ou meses nao encontrada."
+            ), False
+
+        if dias > max_dias:
+            if origem == "meses":
+                return True, (
+                    f"{label} - Ultimo registro ha {dias / 30:.1f} meses "
+                    f"({dias} dias). Limite: {max_dias} dias. Prazo: {prazo}"
+                ), False
+            return True, (
+                f"{label} - Ultimo registro ha {dias} dias. "
+                f"Limite: {max_dias} dias. Prazo: {prazo}"
+            ), False
+
+        if origem == "meses":
+            return False, (
+                f"{label} - Adequado ({dias / 30:.1f} meses / {dias} dias atras)"
+            ), False
+        return False, f"{label} - Adequado ({dias} dias atras)", False
+
+    if tipo == "vacinas_multiplas":
+        faltantes = []
+        ok = []
+        valores_sim = {"SIM", "1", "TRUE", "V", "COMPLETA", "EM_DIA", "EM DIA", "APLICADA"}
+        padrao_data = re.compile(r"\d{2}/\d{2}/\d{2,4}")
+        padrao_dose = re.compile(r"\b(D\d?|R\d|REF|DU)\b")
+
+        for vacina in pratica["vacinas"]:
+            if vacina not in colunas:
+                faltantes.append(vacina)
+                continue
+            valor = str(linha[vacina]).strip()
+            if not valor or valor.lower() in {"nan", "none"}:
+                faltantes.append(vacina)
+                continue
+
+            valor_upper = valor.upper()
+            if valor_upper in valores_sim:
+                ok.append(vacina)
+                continue
+
+            if padrao_data.search(valor) or padrao_dose.search(valor_upper):
+                datas = padrao_data.findall(valor)
+                ok.append(
+                    f"{vacina} (aplicada em {datas[-1]})" if datas
+                    else f"{vacina} (registrada)"
+                )
+            else:
+                faltantes.append(vacina)
+
+        if faltantes:
+            return True, (
+                f"{label} - Vacinas faltantes: {', '.join(faltantes)}. "
+                f"Concluidas: {', '.join(ok) if ok else 'nenhuma'}. Prazo: {prazo}"
+            ), False
+        return False, f"{label} - Adequado (todas as vacinas aplicadas)", False
+
+    if tipo == "texto_vacina":
+        valor = str(linha.get(chave, "")).strip()
+        if not valor or valor.lower() == "nan":
+            for nome_coluna, conteudo in linha.items():
+                if "influenza" in str(nome_coluna).lower():
+                    valor = str(conteudo).strip()
+                    break
+        if not valor or valor.lower() == "nan" or valor == "-":
+            return True, f"{label}: vacina nao registrada", False
+        return False, "", False
+
+    if tipo == "exames_multiplos":
+        faltantes = []
+        ok = []
+        for exame in pratica["exames"]:
+            if exame not in colunas:
+                faltantes.append(exame)
+                continue
+            valor = str(linha[exame]).strip().upper()
+            if valor in {"SIM", "1", "TRUE", "POSITIVO"}:
+                ok.append(exame)
+            elif valor in {"NAO_SE_APLICA", "N/A", "NAO APLICA", "NAO SE APLICA"}:
+                ok.append(f"{exame} (nao se aplica)")
+            else:
+                faltantes.append(exame)
+
+        if faltantes:
+            return True, (
+                f"{label} - Exames faltantes: {', '.join(faltantes)}. "
+                f"Realizados: {', '.join(ok) if ok else 'nenhum'}. Prazo: {prazo}"
+            ), False
+        return False, f"{label} - Adequado (todos os exames realizados)", False
+
+    return True, f"{label} - Tipo de criterio nao reconhecido", False
+
+
+def verificar_criterios(dados, codigo_indicador):
+    """Avalia cada paciente e calcula completude e nivel de prioridade."""
+    boas_praticas = definir_boas_praticas(codigo_indicador)
+    config = INDICADORES[codigo_indicador]
+    niveis = config["niveis_prioridade"]
+    max_prioridade = config["max_prioridade"]
+    colunas = set(dados.columns)
+    hoje_str = datetime.now().strftime("%d/%m/%Y")
+
+    resultados = []
+    for _, linha in dados.iterrows():
+        faltou = 0
+        detalhes = []
+        labels = []
+        aplicaveis = 0
+
+        for pratica in boas_praticas:
+            faltou_crit, detalhe, nao_aplica = _verificar_criterio_detalhado(
+                linha, pratica, colunas, codigo_indicador
+            )
+            if nao_aplica:
+                continue
+            aplicaveis += 1
+            if faltou_crit:
+                faltou += 1
+                detalhes.append(detalhe)
+                labels.append(pratica["label"])
+
+        completude = 100.0 if aplicaveis == 0 else (
+            (aplicaveis - faltou) / aplicaveis
+        ) * 100
+
+        nivel = (
+            niveis.get(max_prioridade, "CRITICO")
+            if faltou >= max_prioridade
+            else niveis.get(faltou, "EM DIA")
+        )
+
+        resultados.append({
+            "Nome": linha["Nome"],
+            "Microarea": linha["Microarea"],
+            "Idade": linha.get("Idade", 0),
+            "Prioridade": faltou,
+            "Nivel": nivel,
+            "Completude (%)": completude,
+            "Qtd Faltante": faltou,
+            "Criterios Faltantes": "; ".join(labels) if labels else "Nenhum",
+            "Detalhamento Faltantes": (
+                "\n".join(detalhes) if detalhes
+                else "Todos os criterios estao adequados"
+            ),
+            "Data Avaliacao": hoje_str,
+        })
+
+    return pd.DataFrame(resultados)
+
+
+# ============================================================
+# --- 8. GRAFICOS ---
+# ============================================================
+
+def gerar_grafico_pizza(df_resultado, codigo_indicador):
+    if not _HAS_MPL:
+        print("AVISO: matplotlib nao instalado - graficos ignorados.")
+        return None
+    contagem = df_resultado["Microarea"].value_counts()
+    fig, ax = plt.subplots(figsize=(10, 7))
+    ax.pie(
+        contagem.values,
+        labels=contagem.index,
+        autopct="%1.1f%%",
+        colors=plt.cm.Set3(np.linspace(0, 1, len(contagem))),
+        startangle=90,
+    )
+    ax.set_title(
+        f"Distribuicao de Pacientes por Microarea\n"
+        f"Indicador {codigo_indicador} - {INDICADORES[codigo_indicador]['nome']}",
+        fontsize=14, fontweight="bold",
+    )
+    ax.axis("equal")
+    fig.tight_layout()
+    nome_arq = f"grafico_pizza_microarea_{codigo_indicador}.png"
+    fig.savefig(nome_arq, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Grafico salvo: {nome_arq}")
+    return nome_arq
+
+
+def gerar_grafico_barras(df_resultado, codigo_indicador):
+    if not _HAS_MPL:
+        print("AVISO: matplotlib nao instalado - graficos ignorados.")
+        return None
+    ordem = ["EM DIA", "MODERADO", "GRAVE", "MUITO GRAVE", "CRITICO"]
+    contagem = df_resultado["Nivel"].value_counts().reindex(ordem, fill_value=0)
+    cores = ["#2ecc71", "#f1c40f", "#e67e22", "#e74c3c", "#c0392b"]
+
+    fig, ax = plt.subplots(figsize=(12, 6))
+    barras = ax.bar(contagem.index, contagem.values, color=cores, edgecolor="black")
+    ax.set_title(
+        f"Classificacao de Risco - Indicador {codigo_indicador}\n"
+        f"{INDICADORES[codigo_indicador]['nome']}",
+        fontsize=14, fontweight="bold",
+    )
+    ax.set_xlabel("Nivel de Prioridade", fontsize=12)
+    ax.set_ylabel("Numero de Pacientes", fontsize=12)
+    for barra, valor in zip(barras, contagem.values):
+        if valor > 0:
+            ax.text(
+                barra.get_x() + barra.get_width() / 2,
+                valor + 0.3, str(valor),
+                ha="center", fontweight="bold",
+            )
+    fig.tight_layout()
+    nome_arq = f"grafico_barras_prioridade_{codigo_indicador}.png"
+    fig.savefig(nome_arq, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Grafico salvo: {nome_arq}")
+    return nome_arq
+
+
+# ============================================================
+# --- 9. ENGENHARIA DE FEATURES ---
+# ============================================================
+
+def criar_features_ml(df_resultado, dados_originais, codigo_indicador):
+    """Cria features para treinar o modelo de ML."""
+    features = df_resultado.copy()
+
+    le_micro = LabelEncoder()
+    features["microarea_cod"] = le_micro.fit_transform(
+        features["Microarea"].astype(str)
+    )
+
+    features["score_urgencia_temporal"] = 100 - features["Completude (%)"]
+    features["dias_min_expirar"] = features["Qtd Faltante"] * 90
+
+    le_nivel = LabelEncoder()
+    features["nivel_cod"] = le_nivel.fit_transform(features["Nivel"])
+
+    dummies = pd.get_dummies(features["Nivel"], prefix="nivel")
+    features = pd.concat([features, dummies], axis=1)
+
+    colunas_numericas = [
+        "Idade", "Prioridade", "microarea_cod",
+        "score_urgencia_temporal", "dias_min_expirar",
+    ]
+    colunas_numericas += [c for c in dummies.columns]
+
+    X = features[colunas_numericas].fillna(0)
+    y_class = features["Prioridade"]
+    y_reg = features["dias_min_expirar"]
+    return X, y_class, y_reg, le_micro, le_nivel, features
+
+
+# ============================================================
+# --- 10. TREINAMENTO DOS MODELOS ---
+# ============================================================
+
+def treinar_modelos(X, y_class, y_reg, codigo_indicador):
+    """Treina o classificador e o regressor Random Forest."""
+    contagem_classes = y_class.value_counts()
+    classes_minimas = contagem_classes[contagem_classes < 2]
+    usar_stratify = len(classes_minimas) == 0
+
+    if not usar_stratify:
+        print(f"\n   AVISO: Classes com apenas 1 amostra detectadas: "
+              f"{dict(classes_minimas)}")
+        print("   -> Usando split NAO estratificado para este indicador.\n")
+
+    if usar_stratify:
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y_class, test_size=0.2, random_state=42, stratify=y_class
+        )
+    else:
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y_class, test_size=0.2, random_state=42
+        )
+
+    clf = RandomForestClassifier(
+        n_estimators=200, max_depth=10, random_state=42, class_weight="balanced"
+    )
+    clf.fit(X_train, y_train)
+    y_pred = clf.predict(X_test)
+    acc = accuracy_score(y_test, y_pred)
+
+    print("\n" + "=" * 50)
+    print(f"  CLASSIFICADOR DE PRIORIDADE - {codigo_indicador}")
+    print("=" * 50)
+    print(f"  Acuracia: {acc:.2%}")
+    print(f"  Split: {'estratificado' if usar_stratify else 'nao estratificado'}")
+    print("\n  Relatorio de Classificacao:")
+    print(classification_report(y_test, y_pred, zero_division=0))
+
+    y_reg_train = y_reg.loc[X_train.index]
+    y_reg_test = y_reg.loc[X_test.index]
+
+    reg = RandomForestRegressor(
+        n_estimators=200, max_depth=10, random_state=42
+    )
+    reg.fit(X_train, y_reg_train)
+    y_reg_pred = reg.predict(X_test)
+    mae = np.mean(np.abs(y_reg_test - y_reg_pred))
+
+    print("\n" + "=" * 50)
+    print(f"  REGRESSOR DE DIAS ATE CONSULTA - {codigo_indicador}")
+    print("=" * 50)
+    print(f"  MAE (Erro Medio Absoluto): {mae:.1f} dias")
+
+    return clf, reg, X_test, y_test, y_pred
+
+
+# ============================================================
+# --- 11. PREVISAO DE DATAS DE CONSULTA ---
+# ============================================================
+
+def prever_consultas(clf, reg, X, features, codigo_indicador):
+    """Preve datas de consulta para todos os pacientes."""
+    prioridade_pred = clf.predict(X)
+    dias_pred = reg.predict(X)
+    dias_pred = np.maximum(dias_pred, 1).astype(int)
+
+    hoje = datetime.now()
+    datas_previstas = [hoje + timedelta(days=int(d)) for d in dias_pred]
+    dias_semana = ["Seg", "Ter", "Qua", "Qui", "Sex", "Sab", "Dom"]
+
+    resultado = features.copy()
+    resultado["Prioridade_Predita"] = prioridade_pred
+    resultado["Data Prevista Consulta"] = [
+        d.strftime("%d/%m/%Y") for d in datas_previstas
+    ]
+    resultado["Dias ate Consulta"] = dias_pred
+    resultado["Dia da Semana"] = [dias_semana[d.weekday()] for d in datas_previstas]
+    return resultado
+
+
+# ============================================================
+# --- 12. LISTA DE BUSCA ATIVA ---
+# ============================================================
+
+def gerar_lista_busca_ativa(df_resultado, codigo_indicador):
+    """Gera lista priorizada e exibe na tela com detalhamento completo."""
+    busca = df_resultado[df_resultado["Qtd Faltante"] > 0].copy()
+    busca = busca.sort_values(["Microarea", "Prioridade"], ascending=[True, False])
+
+    busca_export = busca[[
+        "Nome", "Microarea", "Idade", "Nivel", "Completude (%)",
+        "Criterios Faltantes", "Qtd Faltante",
+        "Detalhamento Faltantes", "Data Avaliacao",
+    ]].copy()
+
+    nome_arq = f"lista_busca_ativa_{codigo_indicador}.csv"
+    busca_export.to_csv(nome_arq, index=False, encoding="utf-8-sig", sep=";")
+
+    print(f"\nLista de Busca Ativa gerada: {nome_arq}")
+    print(f"   Total de pacientes para busca ativa: {len(busca)}")
+    print(f"   Pacientes em dia: {len(df_resultado) - len(busca)}")
+
+    print("\n" + "=" * 80)
+    print("  DISTRIBUICAO DE PACIENTES POR NIVEL DE PRIORIDADE")
+    print(f"  Indicador {codigo_indicador} - {INDICADORES[codigo_indicador]['nome']}")
+    print(f"  Data da avaliacao: {datetime.now().strftime('%d/%m/%Y')}")
+    print("=" * 80)
+
+    ordem_niveis = ["EM DIA", "MODERADO", "GRAVE", "MUITO GRAVE", "CRITICO"]
+    total = len(df_resultado)
+    for nivel in ordem_niveis:
+        qtd = len(df_resultado[df_resultado["Nivel"] == nivel])
+        pct = (qtd / total * 100) if total > 0 else 0
+        barra = "#" * int(pct / 2) + "." * (50 - int(pct / 2))
+        print(f"  {nivel:<14} {qtd:>4}  ({pct:>5.1f}%)  |{barra}|")
+    print("  " + "-" * 78)
+    print(f"  {'TOTAL':<17} {total:>4}  (100.0%)")
+    print("=" * 80)
+
+    print("\n" + "=" * 80)
+    print("  PACIENTES POR NIVEL DE PRIORIDADE - DETALHAMENTO COMPLETO")
+    print("=" * 80)
+    for nivel in ordem_niveis:
+        if nivel == "EM DIA":
+            continue
+        subset = df_resultado[df_resultado["Nivel"] == nivel]
+        if len(subset) == 0:
+            continue
+        print(f"\n  {nivel} - {len(subset)} paciente(s)")
+        print("  " + "-" * 78)
+        subset_ordenado = subset.sort_values(
+            ["Microarea", "Qtd Faltante"], ascending=[True, False]
+        )
+        for _, row in subset_ordenado.iterrows():
+            nome = str(row["Nome"])[:40]
+            microarea = str(row["Microarea"])[:8]
+            idade = int(row["Idade"]) if pd.notna(row["Idade"]) else 0
+            completude = row["Completude (%)"]
+            qtd_falt = int(row["Qtd Faltante"])
+            print(f"\n  | Paciente: {nome}")
+            print(f"  | Microarea: {microarea}  |  Idade: {idade} anos  "
+                  f"|  Completude: {completude:.1f}%  |  Criterios faltantes: {qtd_falt}")
+            detalhamento = str(row.get("Detalhamento Faltantes", ""))
+            if detalhamento and detalhamento != "Todos os criterios estao adequados":
+                print("  |")
+                print("  |  CRITERIOS FALTANTES (detalhado):")
+                for d in detalhamento.split("\n"):
+                    if d.strip():
+                        if len(d) > 95:
+                            print(f"  |    - {d[:92]}")
+                            resto = d[92:]
+                            while resto:
+                                print(f"  |      {resto[:92]}")
+                                resto = resto[92:]
+                        else:
+                            print(f"  |    - {d}")
+    print("\n" + "=" * 80)
+
+    print("\n" + "=" * 80)
+    print("  CRITERIOS FALTANTES - VISAO CONSOLIDADA POR CRITERIO")
+    print("=" * 80)
+
+    contagem_criterios = Counter()
+    detalhes_por_criterio = defaultdict(list)
+
+    for _, row in df_resultado[df_resultado["Qtd Faltante"] > 0].iterrows():
+        criterios_str = str(row.get("Criterios Faltantes", ""))
+        if criterios_str and criterios_str != "Nenhum":
+            for parte in criterios_str.split("; "):
+                contagem_criterios[parte] += 1
+
+        detalhamento = str(row.get("Detalhamento Faltantes", ""))
+        if detalhamento:
+            for linha_det in detalhamento.split("\n"):
+                for criterio in contagem_criterios:
+                    if linha_det.startswith(criterio):
+                        if len(detalhes_por_criterio[criterio]) < 3:
+                            detalhes_por_criterio[criterio].append(
+                                (row["Nome"], linha_det)
+                            )
+
+    if contagem_criterios:
+        total_faltantes = len(df_resultado[df_resultado["Qtd Faltante"] > 0])
+        print(f"\n  {'Criterio Faltante':<50} {'Pacientes':>10} {'%':>7}")
+        print("  " + "-" * 78)
+        for criterio, qtd in contagem_criterios.most_common():
+            pct = (qtd / total_faltantes * 100) if total_faltantes > 0 else 0
+            barra = "#" * int(pct / 5)
+            print(f"  {criterio[:50]:<50} {qtd:>5}/{total_faltantes:<4} "
+                  f"{pct:>6.1f}% {barra}")
+        print("  " + "-" * 78)
+        print(f"  Total de pacientes com pelo menos 1 criterio faltante: {total_faltantes}")
+
+        print("\n" + "=" * 80)
+        print("  EXEMPLOS DE DETALHAMENTO POR CRITERIO FALTANTE")
+        print("  (ate 3 exemplos por criterio)")
+        print("=" * 80)
+
+        boas_praticas = definir_boas_praticas(codigo_indicador)
+        for criterio, qtd in contagem_criterios.most_common():
+            prazo = ""
+            for prac in boas_praticas:
+                if prac["label"] == criterio:
+                    prazo = prac.get("descricao_prazo", "")
+                    break
+            print(f"\n  {criterio}")
+            print(f"     Prazo esperado: {prazo}")
+            print(f"     Pacientes afetados: {qtd}")
+            print("     " + "-" * 74)
+            for nome, detalhe in detalhes_por_criterio.get(criterio, []):
+                print(f"     - {str(nome)[:25]:<25} -> {detalhe[len(criterio) + 3:]}")
+        print("\n" + "=" * 80)
+    else:
+        print("\n  Nenhum criterio faltante - todos os pacientes estao em dia!")
+
+    return busca_export
+
+
+# ============================================================
+# --- 13. AGENDA DE CONSULTAS ---
+# ============================================================
+
+def gerar_agenda_consultas(df_previsao, codigo_indicador, max_dias=150):
+    """Gera agenda de consultas sem descarte silencioso de pacientes."""
+    busca = df_previsao[df_previsao["Qtd Faltante"] > 0].copy()
+    busca = busca.sort_values("Prioridade", ascending=False)
+
+    hoje = datetime.now()
+    data_atual = hoje
+    dias_semana = ["Seg", "Ter", "Qua", "Qui", "Sex", "Sab", "Dom"]
+    agenda = []
+    limite = hoje + timedelta(days=max_dias)
+    avisou = False
+
+    for _, paciente in busca.iterrows():
+        while data_atual.weekday() >= 5:
+            data_atual += timedelta(days=1)
+
+        if data_atual > limite and not avisou:
+            print(f"\n   AVISO: Horizonte de {max_dias} dias atingido. "
+                  "Os pacientes restantes serao agendados em sequencia.")
+            avisou = True
+
+        agenda.append({
+            "Data Agendada": data_atual.strftime("%d/%m/%Y"),
+            "Dia da Semana": dias_semana[data_atual.weekday()],
+            "Microarea": paciente["Microarea"],
+            "Paciente": paciente["Nome"],
+            "Idade": paciente["Idade"],
+            "Nivel Prioridade": paciente["Nivel"],
+            "Criterios Faltantes": paciente["Criterios Faltantes"],
+            "Qtd Faltante": paciente["Qtd Faltante"],
+            "Detalhamento Faltantes": paciente.get("Detalhamento Faltantes", ""),
+        })
+        data_atual += timedelta(days=1)
+
+    df_agenda = pd.DataFrame(agenda)
+    nome_arq = f"agenda_consultas_{codigo_indicador}.csv"
+    df_agenda.to_csv(nome_arq, index=False, encoding="utf-8-sig", sep=";")
+
+    print(f"\nAgenda de consultas gerada: {nome_arq}")
+    print(f"   Total de agendamentos: {len(df_agenda)}")
+    if len(df_agenda) > 0:
+        print(f"   Periodo: {df_agenda['Data Agendada'].iloc[0]} a "
+              f"{df_agenda['Data Agendada'].iloc[-1]}")
+
+    if len(df_agenda) > 0:
+        print("\n" + "=" * 95)
+        print("  AGENDA DE CONSULTAS - BUSCA ATIVA INTELIGENTE")
+        print(f"  Indicador {codigo_indicador} - {INDICADORES[codigo_indicador]['nome']}")
+        print(f"  Data base: {hoje.strftime('%d/%m/%Y')}")
+        print("=" * 95)
+
+        datas_unicas = df_agenda["Data Agendada"].unique()
+        for data in datas_unicas:
+            agenda_dia = df_agenda[df_agenda["Data Agendada"] == data]
+            dia_semana = agenda_dia["Dia da Semana"].iloc[0]
+            print(f"\n  {data} ({dia_semana})")
+            print("  " + "-" * 93)
+            for _, row in agenda_dia.iterrows():
+                nome = str(row["Paciente"])[:32]
+                microarea = str(row["Microarea"])[:8]
+                idade = int(row["Idade"]) if pd.notna(row["Idade"]) else 0
+                nivel = str(row["Nivel Prioridade"])
+                qtd_falt = int(row["Qtd Faltante"])
+                print(f"\n  {nome:<32} | MA: {microarea:<8} | Idade: {idade:>3} "
+                      f"| {nivel:<12} | Faltam: {qtd_falt}")
+                detalhamento = str(row.get("Detalhamento Faltantes", ""))
+                if detalhamento and detalhamento != "Todos os criterios estao adequados":
+                    for linha_det in detalhamento.split("\n"):
+                        if linha_det.strip():
+                            if len(linha_det) > 88:
+                                print(f"       -> {linha_det[:85]}")
+                                resto = linha_det[85:]
+                                while resto:
+                                    print(f"          {resto[:85]}")
+                                    resto = resto[85:]
+                            else:
+                                print(f"       -> {linha_det}")
+            print("\n  " + "-" * 93)
+            print(f"  Total do dia: {len(agenda_dia)} consulta(s)")
+
+        print("\n" + "=" * 95)
+        print("  RESUMO DA AGENDA")
+        print("=" * 95)
+        print("\n  Consultas por dia da semana:")
+        for dia in ["Seg", "Ter", "Qua", "Qui", "Sex"]:
+            qtd = len(df_agenda[df_agenda["Dia da Semana"] == dia])
+            if qtd > 0:
+                print(f"     {dia}: {qtd:>3}  {'#' * qtd}")
+
+        print("\n  Consultas por nivel de prioridade:")
+        for nivel in ["MODERADO", "GRAVE", "MUITO GRAVE", "CRITICO"]:
+            qtd = len(df_agenda[df_agenda["Nivel Prioridade"] == nivel])
+            if qtd > 0:
+                pct = (qtd / len(df_agenda) * 100)
+                print(f"     {nivel:<12}: {qtd:>3}  ({pct:.1f}%)")
+
+        print("\n  Consultas por microarea:")
+        for ma, qtd in df_agenda["Microarea"].value_counts().sort_index().items():
+            print(f"     MA {ma}: {qtd:>3}  {'#' * qtd}")
+
+        print("\n  " + "-" * 93)
+        print(f"  TOTAL: {len(df_agenda)} consultas agendadas em "
+              f"{len(datas_unicas)} dia(s) uteis")
+        print("=" * 95)
+    else:
+        print("\n  Nenhum paciente precisa de agendamento - todos estao em dia!")
+
+    return df_agenda
+
+
+# ============================================================
+# --- 14. RELATORIO DE COMPLETUDE ---
+# ============================================================
+
+def relatorio_completude(df_resultado, codigo_indicador):
+    """Gera relatorio de completude por microarea."""
+    rel = df_resultado.groupby("Microarea").agg({
+        "Nome": "count",
+        "Completude (%)": "mean",
+        "Qtd Faltante": "mean",
+        "Prioridade": "mean",
+    }).round(2)
+
+    rel.columns = [
+        "Total de Pacientes", "Completude Media (%)",
+        "Media de Criterios Faltantes", "Prioridade Media",
+    ]
+    rel = rel.sort_values("Prioridade Media", ascending=False)
+
+    nome_arq = f"relatorio_completude_{codigo_indicador}.csv"
+    rel.to_csv(nome_arq, encoding="utf-8-sig", sep=";")
+
+    print("\nRelatorio de completude por microarea:")
+    print(f"   Arquivo: {nome_arq}")
+    print(rel.to_string())
+    return rel
+
+
+# ============================================================
+# --- 15. SALVAMENTO DO MODELO ---
+# ============================================================
+
+def salvar_modelo(clf, reg, le_micro, le_nivel, codigo_indicador,
+                  colunas_features, boas_praticas):
+    """Salva o modelo treinado em arquivo .pkl para reuso."""
+    modelo_bundle = {
+        "codigo_indicador": codigo_indicador,
+        "nome_indicador": INDICADORES[codigo_indicador]["nome"],
+        "classificador": clf,
+        "regressor": reg,
+        "label_encoder_microarea": le_micro,
+        "label_encoder_nivel": le_nivel,
+        "colunas_features": colunas_features,
+        "boas_praticas": boas_praticas,
+        "config_indicador": INDICADORES[codigo_indicador],
+        "data_treinamento": datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
+        "versao": "1.0",
+    }
+
+    nome_arq = f"modelo_busca_ativa_{codigo_indicador}.pkl"
+    joblib.dump(modelo_bundle, nome_arq)
+
+    print("\n" + "=" * 60)
+    print("  MODELO SALVO COM SUCESSO")
+    print("=" * 60)
+    print(f"  Arquivo: {nome_arq}")
+    print(f"  Indicador: {codigo_indicador} - {INDICADORES[codigo_indicador]['nome']}")
+    print(f"  Data: {modelo_bundle['data_treinamento']}")
+    print(f"  Versao: {modelo_bundle['versao']}")
+    print(f"  Features: {len(colunas_features)} colunas")
+    print(f"  Boas Praticas: {len(boas_praticas)} criterios")
+    print("=" * 60)
+    return nome_arq
+
+
+# ============================================================
+# --- 16. CARREGAR E USAR MODELO SALVO ---
+# ============================================================
+
+def carregar_e_usar_modelo(caminho_modelo, caminho_csv):
+    """Carrega um modelo salvo e aplica em um novo CSV."""
+    modelo = joblib.load(caminho_modelo)
+    print(f"\nModelo carregado: {caminho_modelo}")
+    print(f"   Indicador original: {modelo['codigo_indicador']}")
+
+    df, _ = carregar_csv(caminho_csv)
+    codigo_novo = detectar_indicador(df.columns)
+
+    if codigo_novo != modelo["codigo_indicador"]:
+        print(f"\nAVISO: O CSV corresponde ao indicador {codigo_novo}, "
+              f"mas o modelo foi treinado para {modelo['codigo_indicador']}.")
+        print("   Recomenda-se treinar um novo modelo para este indicador.")
+        return None
+
+    dados, _ = preparar_dados(df, codigo_novo)
+    df_resultado = verificar_criterios(dados, codigo_novo)
+    X, _, _, _, _, features = criar_features_ml(df_resultado, dados, codigo_novo)
+
+    for coluna in modelo["colunas_features"]:
+        if coluna not in X.columns:
+            X[coluna] = 0
+    X = X[modelo["colunas_features"]]
+
+    return prever_consultas(
+        modelo["classificador"], modelo["regressor"], X, features, codigo_novo
+    )
+
+
+# ============================================================
+# --- FLUXO PRINCIPAL ---
+# ============================================================
+
+def main(caminho_csv=None):
+    print("=" * 60)
+    print("  BUSCA ATIVA INTELIGENTE - CODIGO INTEGRADO MULTINDICADOR")
+    print("  Deteccao automatica: C2, C3, C4, C5, C6, C7")
+    print("=" * 60)
+
+    print("\n[1/10] Carregando arquivo CSV...")
+    df, nome_arquivo = carregar_csv(caminho_csv)
+
+    print("\n[2/10] Detectando indicador...")
+    codigo_indicador = detectar_indicador(df.columns)
+    config = INDICADORES[codigo_indicador]
+
+    print(f"\n[3/10] Preparando dados para {codigo_indicador} - {config['nome']}...")
+    dados, mapeamento = preparar_dados(df, codigo_indicador)
+    print(f"   Dados preparados: {len(dados)} pacientes")
+    print(f"   Colunas mapeadas: {len(mapeamento)}")
+
+    print(f"\n[4/10] Verificando {config['num_boas_praticas']} boas praticas...")
+    df_resultado = verificar_criterios(dados, codigo_indicador)
+    print(f"   Classificacao concluida para {len(df_resultado)} pacientes")
+
+    print("\n[5/10] Gerando graficos exploratorios...")
+    gerar_grafico_pizza(df_resultado, codigo_indicador)
+    gerar_grafico_barras(df_resultado, codigo_indicador)
+
+    print("\n[6/10] Criando features para Machine Learning...")
+    X, y_class, y_reg, le_micro, le_nivel, features = criar_features_ml(
+        df_resultado, dados, codigo_indicador
+    )
+    print(f"   Features criadas: {X.shape[1]} colunas")
+    print(f"   Amostras: {X.shape[0]}")
+
+    print("\n[7/10] Treinando modelos de ML (Random Forest)...")
+    clf, reg, X_test, y_test, y_pred = treinar_modelos(
+        X, y_class, y_reg, codigo_indicador
+    )
+    df_previsao = prever_consultas(clf, reg, X, features, codigo_indicador)
+
+    print("\n[8/10] Gerando lista de busca ativa...")
+    busca = gerar_lista_busca_ativa(df_previsao, codigo_indicador)
+
+    print("\n[9/10] Gerando agenda de consultas...")
+    agenda = gerar_agenda_consultas(df_previsao, codigo_indicador)
+
+    print("\n[9b/10] Gerando relatorio de completude...")
+    relatorio_completude(df_resultado, codigo_indicador)
+
+    print("\n[10/10] Salvando modelo treinavel...")
+    boas_praticas = definir_boas_praticas(codigo_indicador)
+    nome_modelo = salvar_modelo(
+        clf, reg, le_micro, le_nivel, codigo_indicador,
+        list(X.columns), boas_praticas,
+    )
+
+    print("\n" + "=" * 60)
+    print("  PIPELINE CONCLUIDO COM SUCESSO!")
+    print("=" * 60)
+    print(f"  Indicador: {codigo_indicador} - {config['nome']}")
+    print(f"  Pacientes analisados: {len(df_resultado)}")
+    print(f"  Pacientes para busca ativa: {len(busca)}")
+    print(f"  Modelo salvo: {nome_modelo}")
+    print("=" * 60)
+
+    return df_resultado, df_previsao, busca, agenda, nome_modelo
+
+
+if __name__ == "__main__":
+    main()
